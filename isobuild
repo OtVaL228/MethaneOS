@@ -3,17 +3,13 @@ cd /run/media/methane/608b5494-c87e-454c-9b50-7fddf4ffddb4/x86_64/methaneos/
 mksquashfs /run/media/methane/608b5494-c87e-454c-9b50-7fddf4ffddb4/x86_64/squashfs-root /run/media/methane/608b5494-c87e-454c-9b50-7fddf4ffddb4/x86_64/methaneos/methane/x86_64/airootfs.sfs
 
 xorriso -as mkisofs \
-  -o methaneosbeta6.iso \
+  -o methaneos-validation.iso \
   -iso-level 3 \
-  -isohybrid-mbr boot/syslinux/isohdpfx.bin \
-  -c boot/syslinux/boot.cat \
-  -b boot/syslinux/isolinux.bin \
+  -b boot/grub/i386-pc/eltorito.img --grub2-boot-info --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
    -no-emul-boot -boot-load-size 4 -boot-info-table \
   -eltorito-alt-boot \
   -e EFI/BOOT/efi.img \
    -no-emul-boot \
    -isohybrid-gpt-basdat \
+   -volid 'MethaneOS' \
   "/run/media/methane/608b5494-c87e-454c-9b50-7fddf4ffddb4/x86_64/methaneos/"
-
-
-  sudo isohybrid --uefi methaneosbeta6.iso
