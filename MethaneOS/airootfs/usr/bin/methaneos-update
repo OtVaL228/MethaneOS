@@ -1,0 +1,343 @@
+#!/bin/bash
+
+set -e  # Завершаем скрипт при любой ошибке
+
+# Константы
+CONFIG_FILE="/etc/update-config.conf"  # Единый файл конфигурации
+UPDATE_TMP="/tmp/update"
+MOUNT_POINT="$UPDATE_TMP/mount"
+UPDATE_INFO_URL="https://otval228.github.io/methaneos_repo/update.json"
+UPDATE_URL="https://otval228.github.io/methaneos_repo/update.squashfs"
+GPG_KEY="/usr/share/update-dir/public.gpg"
+LOG_FILE="/var/log/update-script.log"
+UPDATE_JSON="$UPDATE_TMP/update.json"
+METHANEOS_VER="/etc/methaneos_release"
+
+# Логирование
+function log {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+}
+
+# Чтение локальной версии
+function get_local_version {
+    if [[ ! -f "$METHANEOS_VER" ]]; then
+        log "Ошибка: Файл $METHANEOS_VER отсутствует."
+        exit 1
+    fi
+    jq -r '.version' "$METHANEOS_VER"
+}
+
+function load_config {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    else
+        log "Конфигурационный файл отсутствует. Используются настройки по умолчанию."
+        #Повышение прав до root, если до сих пор нет
+        if [[ $EUID -ne 0 ]]; then
+        log "Повышение привилегий для выполнения: $0 $*"
+        exec pkexec /usr/bin/methaneos-update check --disable-internal-agent "$0" "$@"
+        exit
+        fi
+        # Устанавливаем настройки по умолчанию
+        BACKUP_ENABLED=true
+        BACKUP_DIR="/var/backups/updates"
+        MAX_BACKUPS=5
+        MAX_BACKUP_AGE=7
+        UPDATE_BRANCH="dev"
+
+        # Создаем конфигурационный файл и записываем настройки
+        cat <<EOF > "$CONFIG_FILE"
+# Конфигурационный файл для обновлений
+# Автоматически создан $(date)
+
+BACKUP_ENABLED=$BACKUP_ENABLED
+BACKUP_DIR=$BACKUP_DIR
+MAX_BACKUPS=$MAX_BACKUPS
+MAX_BACKUP_AGE=$MAX_BACKUP_AGE
+UPDATE_BRANCH=$UPDATE_BRANCH
+EOF
+
+        log "Конфигурационный файл создан: $CONFIG_FILE"
+        load_config
+    fi
+}
+
+# Очистка временных файлов
+function cleanup {
+    log "Очистка временных файлов..."
+    umount "$MOUNT_POINT" 2>/dev/null || true
+    rm -rf "$UPDATE_TMP"
+}
+
+# Очистка старых резервных копий
+function cleanup_old_backups {
+    if [[ "$BACKUP_ENABLED" != "true" ]]; then
+        return
+    fi
+
+    find "$BACKUP_DIR" -type d -mtime +${MAX_BACKUP_AGE:-7} -exec rm -rf {} \; || true
+    backups=($(ls -dt "$BACKUP_DIR"/* 2>/dev/null || true))
+    while [[ ${#backups[@]} -gt ${MAX_BACKUPS:-5} ]]; do
+        log "Удаление старой резервной копии: ${backups[-1]}"
+        rm -rf "${backups[-1]}"
+        backups=("${backups[@]:0:${#backups[@]}-1}")
+    done
+}
+
+# Создание резервной копии на основе update.json
+function create_backup {
+    if [[ "$BACKUP_ENABLED" != "true" ]]; then
+        log "Резервное копирование отключено в конфигурации. Пропуск."
+        return
+    fi
+
+    local backup_dir="$BACKUP_DIR/backup-$(date '+%Y%m%d%H%M%S')"
+    mkdir -p "$backup_dir"
+    log "Создание резервной копии в каталоге: $backup_dir"
+    #Повышение прав до root, если до сих пор нет
+    if [[ $EUID -ne 0 ]]; then
+    exec pkexec --disable-internal-agent "$0" "$@"
+    fi
+
+    local actions=$(jq -c '.actions[]' "$UPDATE_JSON")
+    for action in $actions; do
+        enabled=$(echo "$action" | jq -r '.enabled // true')
+        if [[ "$enabled" != "true" ]]; then
+            log "Пропуск действия: $(echo "$action" | jq -r '.type')"
+            continue
+        fi
+
+        type=$(echo "$action" | jq -r '.type')
+        case "$type" in
+            kernel)
+                log "Пропуск резервного копирования ядра (disabled в update.json)."
+                ;;
+            pacman)
+                log "Резервное копирование пакетов pacman не требуется."
+                ;;
+            files)
+                log "Резервное копирование файлов..."
+                files=($(echo "$action" | jq -r '.files_path[]'))
+                for file in "${files[@]}"; do
+                    if [[ -f "$file" ]]; then
+                        dest="$backup_dir$(dirname "$file")"
+                        mkdir -p "$dest"
+                        cp "$file" "$dest/"
+                        log "Сохранён файл: $file"
+                    else
+                        log "Файл не найден: $file. Пропуск."
+                    fi
+                done
+                ;;
+            script)
+                log "Пропуск резервного копирования пользовательского скрипта."
+                ;;
+            *)
+                log "Неизвестный тип действия: $type. Пропуск."
+                ;;
+        esac
+    done
+
+    log "Очистка старых резервных копий..."
+    cleanup_old_backups
+    log "Резервное копирование завершено."
+}
+
+# Загрузка информации об обновлении
+function fetch_update_info {
+    # Повышение прав до root. По хорошему, проверка на наличие обновлений должна происходить без root, но
+    # мы на данном этапе не можем гарантировать, что это будет работать на всех сборках MethaneOS.
+    #if [[ $EUID -ne 0 ]]; then
+    #exec pkexec --disable-internal-agent "$0" "$@"
+    #fi
+    log "Скачивание информации об обновлении..."
+    mkdir -p "$UPDATE_TMP"
+    wget -q "$UPDATE_INFO_URL" -O "$UPDATE_TMP/update.json"
+
+    if [[ ! -f "$UPDATE_TMP/update.json" ]]; then
+        log "Ошибка: не удалось загрузить update.json."
+        cleanup
+        exit 1
+    fi
+}
+
+# Сравнение версий
+function version_greater {
+    [[ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" != "$1" ]]
+}
+
+# Проверка необходимости обновления
+function check_update {
+    local local_version remote_version
+    local_version=$(get_local_version)
+    remote_version=$(jq -r '.version' "$UPDATE_JSON" 2>/dev/null)
+
+    if [[ -z "$remote_version" ]]; then
+        log "Ошибка: Некорректный update.json."
+        exit 1
+    fi
+
+    if version_greater "$local_version" "$remote_version"; then
+        log "Доступно обновление с версии $local_version до $remote_version."
+        return 0
+    else
+        log "Обновление не требуется."
+        return 1
+    fi
+}
+
+# Основная логика обновления
+function perform_update {
+    log "Монтирование обновления..."
+    #Повышение прав до root, если до сих пор нет
+    if [[ $EUID -ne 0 ]]; then
+    exec pkexec --disable-internal-agent "$0" "$@"
+    fi
+    mkdir -p "$MOUNT_POINT"
+    mount -o loop "$UPDATE_TMP/update.squashfs" "$MOUNT_POINT"
+
+    # Проверка на опасные команды
+    function check_dangerous_commands {
+    DANGEROUS_COMMANDS=("rm -rf /" "rm -rf /*" ":(){ :|:& };:" "command >/dev/sda")
+    for cmd in "${DANGEROUS_COMMANDS[@]}"; do
+        if grep -qF "$cmd" "$1"; then
+            log "Обнаружена опасная команда: $cmd"
+            return 1
+        fi
+    done
+    return 0
+    }
+
+
+    if [[ ! -f "$UPDATE_JSON" ]]; then
+        log "Ошибка: файл update.json отсутствует."
+        cleanup
+        exit 1
+    fi
+
+    log "Чтение действий обновления..."
+    actions=$(jq -c '.actions[]' "$UPDATE_JSON") || { log "Ошибка чтения update.json!"; cleanup; exit 1; }
+
+    for action in $actions; do
+        enabled=$(echo "$action" | jq -r '.enabled // true')
+        if [[ "$enabled" != "true" ]]; then
+            log "Пропуск действия: $(echo "$action" | jq -r '.type')"
+            continue
+        fi
+
+            # Действия
+    function handle_kernel {
+    log "Обновление ядра..."
+    local kernel_path="$1"
+    local initramfs_path="$2"
+    local destination="$3"
+
+    if [[ -f "$kernel_path" && -f "$initramfs_path" ]]; then
+        cp "$kernel_path" "$destination/vmlinuz-linux"
+        cp "$initramfs_path" "$destination/initramfs-linux.img"
+        mkinitcpio -p linux || { log "Ошибка при генерации initramfs."; return 1; }
+    else
+        log "Ядро или initramfs отсутствуют в обновлении."
+    fi
+    }
+
+    function handle_pacman {
+        log "Обновление пакетов через pacman..."
+        local packages=("$@")
+        if [[ "${#packages[@]}" -gt 0 ]]; then
+            for package in "${packages[@]}"; do
+                if [[ ! -f "$package" ]]; then
+                    log "Пакет $package не найден. Пропуск."
+                    continue
+                fi
+                sudo pacman -U "$package" --noconfirm || { log "Ошибка обновления пакета $package."; return 1; }
+            done
+        else
+        log "Нет пакетов для обновления."
+        fi
+        }
+
+        function handle_script {
+            log "Выполнение пользовательского скрипта..."
+            local script_path="$1"
+
+            if [[ ! -f "$script_path" ]]; then
+            log "Ошибка: скрипт $script_path не найден."
+            return 1
+            fi
+
+            if [[ ! -x "$script_path" ]]; then
+            log "Скрипт $script_path не имеет прав на выполнение. Добавляем права..."
+            chmod +x "$script_path" || { log "Ошибка изменения прав на $script_path"; return 1; }
+            fi
+
+            check_dangerous_commands "$script_path" || { log "Обнаружены опасные команды в $script_path."; return 1; }
+            bash "$script_path" || { log "Ошибка выполнения скрипта $script_path."; return 1; }
+            }
+
+        type=$(echo "$action" | jq -r '.type')
+        case "$type" in
+            kernel)
+                handle_kernel "$(echo "$action" | jq -r '.path')" \
+                              "$(echo "$action" | jq -r '.initramfs')" \
+                              "$(echo "$action" | jq -r '.destination')" || update_status="неуспешно"
+                ;;
+            pacman)
+                packages=($(echo "$action" | jq -r '.packages[]'))
+                handle_pacman "${packages[@]}" || update_status="неуспешно"
+                ;;
+            script)
+                handle_script "$(echo "$action" | jq -r '.script_path')" || update_status="неуспешно"
+                ;;
+            *)
+                log "Неизвестный тип действия: $type"
+                update_status="неуспешно"
+                ;;
+        esac
+    done
+
+    cleanup
+    log "Обновление завершено успешно."
+}
+
+# Основная функция
+function main {
+    load_config
+    cleanup_old_backups
+    fetch_update_info
+    check_update
+    #verify_update
+
+    if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+        fetch_update
+        create_backup
+        perform_update
+    else
+        log "Обновление не требуется."
+    fi
+}
+
+# Обработка параметров командной строки
+case "$1" in
+    check)
+        load_config
+        fetch_update_info
+        check_update
+        if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+            log "Обновление доступно."
+            exit 0
+        else
+            log "Обновление не требуется."
+            exit 0
+        fi
+        ;;
+    --force-update)
+        load_config
+        fetch_update_info
+        fetch_update
+        perform_update
+        ;;
+    *)
+        main
+        ;;
+esac
