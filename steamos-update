@@ -1,479 +1,289 @@
 #!/bin/bash
 
-set -e  # Завершаем скрипт при любой ошибке
+set -euo pipefail
 
-# Константы
-CONFIG_FILE="/etc/methaneos/update-config.conf"  # Единый файл конфигурации
+CONFIG_FILE="/etc/methaneos/update-config.conf"
 UPDATE_TMP="/tmp/update"
 MOUNT_POINT="$UPDATE_TMP/mount"
-LATEST_UPDATE_INFO_URL="https://otval228.github.io/methaneos_repo/versions/branch/$UPDATE_BRANCH/latest_update.json"
-UPDATE_INFO_URL="https://otval228.github.io/methaneos_repo/versions/branch/$branch/$version/update.json"
-UPDATE_URL="https://otval228.github.io/methaneos_repo/update.squashfs"
-GPG_KEY="/usr/share/update-dir/public.gpg"
-LOG_FILE="/var/log/methaneup/update-script.log"
+LATEST_INFO_PATH="$UPDATE_TMP/latest_update.json"
 UPDATE_JSON="$UPDATE_TMP/files/update.json"
+LOG_FILE="/var/log/methaneup/update-script.log"
 METHANEOS_VER="/etc/methaneos/methaneos_release"
+
 UPDATE_AVAILABLE=false
 CRITICAL_UPDATE_AVAILABLE=false
+LATEST_VERSION=""
+MIN_VERSION=""
+CURRENT_VERSION=""
+AVAILABLE_VERSIONS=()
 
-# Логирование
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_ARGS=("$@")
+
 function log {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+    local message="$1"
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') ${message}" | tee -a "$LOG_FILE" >&2
+}
+
+function ensure_root_for_update {
+    if [[ $EUID -ne 0 ]]; then
+        log "Требуются права root. Перезапуск через pkexec..."
+        if command -v pkexec >/dev/null 2>&1; then
+            exec pkexec --disable-internal-agent "$SCRIPT_PATH" "${SCRIPT_ARGS[@]}"
+        fi
+        log "pkexec недоступен. Запустите скрипт с правами root."
+        exit 1
+    fi
 }
 
 function load_config {
     if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
         source "$CONFIG_FILE"
-        # Переименовываем BRANCH из конфига в UPDATE_BRANCH
-        UPDATE_BRANCH="$BRANCH"
-    else
-        log "Конфигурационный файл отсутствует. Используются настройки по умолчанию."
-        #Повышение прав до root, если до сих пор нет
-        if [[ $EUID -ne 0 ]]; then
-        log "Повышение привилегий для выполнения: $0 $*"
-        exec pkexec /usr/bin/methaneos-update check --disable-internal-agent "$0" "$@"
-        exit
+        if [[ -z "${UPDATE_BRANCH:-}" ]]; then
+            UPDATE_BRANCH="${BRANCH:-dev}"
         fi
-        # Устанавливаем настройки по умолчанию
-        BACKUP_ENABLED=true
-        BACKUP_DIR="/var/backups/updates"
-        MAX_BACKUPS=5
-        MAX_BACKUP_AGE=7
-        BRANCH="dev"
+    else
+        log "Конфигурационный файл не найден. Создаю файл с настройками по умолчанию."
+        local default_branch="dev"
+        local default_backup_dir="/var/backups/updates"
 
-        # Создаем конфигурационный файл и записываем настройки
-        cat <<EOF > "$CONFIG_FILE"
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        cat <<CFG >"$CONFIG_FILE"
 # Конфигурационный файл для обновлений
 # Автоматически создан $(date)
 
-BACKUP_ENABLED=$BACKUP_ENABLED
-BACKUP_DIR=$BACKUP_DIR
-MAX_BACKUPS=$MAX_BACKUPS
-MAX_BACKUP_AGE=$MAX_BACKUP_AGE
-UPDATE_BRANCH=$UPDATE_BRANCH
-EOF
-
-        log "Конфигурационный файл создан: $CONFIG_FILE"
-        load_config
+BRANCH=$default_branch
+UPDATE_BRANCH=$default_branch
+BACKUP_ENABLED=true
+BACKUP_DIR=$default_backup_dir
+MAX_BACKUPS=5
+MAX_BACKUP_AGE=7
+CFG
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
     fi
+
+    BRANCH="${BRANCH:-${UPDATE_BRANCH:-dev}}"
+    UPDATE_BRANCH="${UPDATE_BRANCH:-$BRANCH}"
+    BACKUP_ENABLED="${BACKUP_ENABLED:-true}"
+    BACKUP_DIR="${BACKUP_DIR:-/var/backups/updates}"
+    MAX_BACKUPS="${MAX_BACKUPS:-5}"
+    MAX_BACKUP_AGE="${MAX_BACKUP_AGE:-7}"
 }
 
-# Очистка временных файлов
 function cleanup {
-    if [[ $EUID -ne 0 ]]; then
-    log "Повышение привилегий для выполнения: $0 $*"
-    exec pkexec /usr/bin/methaneos-update check --disable-internal-agent "$0" "$@"
-    exit
+    if [[ -d "$UPDATE_TMP" ]]; then
+        log "Очистка временных файлов..."
+        if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+            umount "$MOUNT_POINT" 2>/dev/null || log "Не удалось размонтировать $MOUNT_POINT"
+        fi
+        rm -rf "$UPDATE_TMP" 2>/dev/null || log "Не удалось удалить $UPDATE_TMP"
     fi
-    log "Очистка временных файлов..."
-    umount "$MOUNT_POINT" 2>/dev/null || true
-    rm -rf "$UPDATE_TMP"
 }
 
-# Очистка старых резервных копий
 function cleanup_old_backups {
     if [[ "$BACKUP_ENABLED" != "true" ]]; then
         return
     fi
 
-    find "$BACKUP_DIR" -type d -mtime +${MAX_BACKUP_AGE:-7} -exec rm -rf {} \; || true
-    backups=($(ls -dt "$BACKUP_DIR"/* 2>/dev/null || true))
-    while [[ ${#backups[@]} -gt ${MAX_BACKUPS:-5} ]]; do
-        log "Удаление старой резервной копии: ${backups[-1]}"
-        rm -rf "${backups[-1]}"
-        backups=("${backups[@]:0:${#backups[@]}-1}")
-    done
+    if [[ -d "$BACKUP_DIR" ]]; then
+        find "$BACKUP_DIR" -type d -mtime +"${MAX_BACKUP_AGE}" -exec rm -rf {} \; 2>/dev/null || true
+        mapfile -t backups < <(ls -dt "$BACKUP_DIR"/* 2>/dev/null || true)
+        while [[ ${#backups[@]} -gt ${MAX_BACKUPS} ]]; do
+            local oldest="${backups[-1]}"
+            log "Удаление старой резервной копии: $oldest"
+            rm -rf "$oldest" 2>/dev/null || true
+            backups=("${backups[@]:0:${#backups[@]}-1}")
+        done
+    fi
 }
 
-# Создание резервной копии на основе update.json
-function create_backup {
-    if [[ "$BACKUP_ENABLED" != "true" ]]; then
-        log "Резервное копирование отключено в конфигурации. Пропуск."
-        return
-    fi
-
-    local backup_dir="$BACKUP_DIR/backup-$(date '+%Y%m%d%H%M%S')"
-    mkdir -p "$backup_dir"
-    log "Создание резервной копии в каталоге: $backup_dir"
-    #Повышение прав до root, если до сих пор нет
-    if [[ $EUID -ne 0 ]]; then
-    exec pkexec --disable-internal-agent "$0" "$@"
-    fi
-
-    local actions=$(jq -c '.actions[]' "$UPDATE_JSON")
-    for action in $actions; do
-        enabled=$(echo "$action" | jq -r '.enabled // true')
-        if [[ "$enabled" != "true" ]]; then
-            log "Пропуск действия: $(echo "$action" | jq -r '.type')"
-            continue
-        fi
-
-        type=$(echo "$action" | jq -r '.type')
-        case "$type" in
-            kernel)
-                log "Пропуск резервного копирования ядра (disabled в update.json)."
-                ;;
-            pacman)
-                log "Резервное копирование пакетов pacman не требуется."
-                ;;
-            files)
-                log "Резервное копирование файлов..."
-                files=($(echo "$action" | jq -r '.files_path[]'))
-                for file in "${files[@]}"; do
-                    if [[ -f "$file" ]]; then
-                        dest="$backup_dir$(dirname "$file")"
-                        mkdir -p "$dest"
-                        cp "$file" "$dest/"
-                        log "Сохранён файл: $file"
-                    else
-                        log "Файл не найден: $file. Пропуск."
-                    fi
-                done
-                ;;
-            script)
-                log "Пропуск резервного копирования пользовательского скрипта."
-                ;;
-            *)
-                log "Неизвестный тип действия: $type. Пропуск."
-                ;;
-        esac
-    done
-
-    log "Очистка старых резервных копий..."
-    cleanup_old_backups
-    log "Резервное копирование завершено."
-}
-
-# Получение информации о последнем обновлении
 function fetch_latest_update_info {
-    log "Получение информации о последнем обновлении для ветки $UPDATE_BRANCH"
-    LATEST_UPDATE_INFO_URL="https://otval228.github.io/methaneos_repo/versions/branch/$UPDATE_BRANCH/latest_update.json"
     mkdir -p "$UPDATE_TMP"
-    wget -q "${LATEST_UPDATE_INFO_URL}?branch=${UPDATE_BRANCH}" -O "$UPDATE_TMP/latest_update.json" || {
-        log "Ошибка загрузки latest_update.json"
+    local url="https://otval228.github.io/methaneos_repo/versions/branch/$UPDATE_BRANCH/latest_update.json"
+    log "Загрузка информации о последнем обновлении ($url)"
+    if ! wget -q "$url" -O "$LATEST_INFO_PATH"; then
+        log "Не удалось загрузить latest_update.json"
         cleanup
         exit 1
-    }
+    fi
 }
 
-# Получение информации для конкретной версии
 function fetch_version_update_info {
     local target_version="$1"
-    log "Получение информации для версии $target_version (ветка $UPDATE_BRANCH)"
-
-    local version_update_url="https://otval228.github.io/methaneos_repo/versions/branch/${UPDATE_BRANCH}/${target_version}/update.json"
-    wget -q "$version_update_url" -O "$UPDATE_JSON" || {
-        log "Ошибка загрузки update.json для версии $target_version"
-        exit 1
-    }
-}
-
-# Обновлённая функция check_update
-function version_lt {
-    local a=$1 b=$2
-    if [ "$a" = "$b" ]; then
-        return 1  # Версии равны → false
-    fi
-    # Возвращаем true, если a < b
-    [ "$(printf '%s\n' "$a" "$b" | sort -V | head -n1)" = "$a" ]
-}
-
-function check_update {
-    load_config
-    fetch_latest_update_info
-
-    latest_info="$UPDATE_TMP/latest_update.json"
-    latest_version=$(jq -r '.version // ""' "$latest_info")
-    min_ver=$(jq -r '.minver // "1.0"' "$latest_info")
-    json_update_available=$(jq -r '.update_available | if . == null then "true" else tostring end' "$latest_info")
-     [[ -z "$json_update_available" ]] && json_update_available="false"
-     # Чтение changelog через jq
-     CHANGELOG=$(jq -r '.changelog // empty' "$latest_info")
-     # Вывод changelog
-     echo -e "\e[32mChangelog:\e[0m $CHANGELOG"
-
-    local current_version=$(tr -d '[:space:]' < "$METHANEOS_VER")
-
-    log "Текущая версия: $current_version | Минимальная: $min_ver | Доступная: $latest_version | Статус обновления: $json_update_available"
-
-    local update_available=false
-    local critical_update=false
-
-    if version_lt "$current_version" "$min_ver"; then
-        log "Требуется обновление до минимальной версии $min_ver"
-        CRITICAL_UPDATE_AVAILABLE=true
-        #fetch_version_update_info "$min_ver"
-       # update_version "$min_ver"
-    #    current_version="$min_ver"
-   #   CRITICAL_UPDATE_AVAILABLE= "true"
-     #   echo $CRITICAL_UPDATE_AVAILABLE
-    fi
-
-    # Проверка актуальной версии
-    if version_lt "$current_version" "$latest_version" && [[ "$json_update_available" == "true" ]]; then
-        log "Доступно обновление до $latest_version"
-        UPDATE_AVAILABLE=true
-     elif version_lt "$current_version" "$latest_version" && [[ "$json_update_available" == "false" ]]; then
-        log "Обновление $latest_version пока недоступно для скачивания. Повторите попытку позже."
-        #UPDATE_AVAILABLE= "true"
-       # fetch_version_update_info "$latest_version"
-       # update_version "$latest_version"
-    else
-        log "Система актуальна"
-    fi
-
-    # Возвращаем статусы
-    #echo "${critical_update}|${update_available}|${latest_version}|${min_ver}"
-    return 0;
-}
-
-function update_redirect {
-    if [[ "$CRITICAL_UPDATE_AVAILABLE" == "true" && "$UPDATE_AVAILABLE" == "true" ]]; then
-        if [[ $EUID -ne 0 ]]; then
-        exec pkexec --disable-internal-agent "$0" "$@"
-        fi
-        apply_critical_update $min_ver
-        apply_regular_update $latest_version
-        exit 0
-    elif [[ "$CRITICAL_UPDATE_AVAILABLE" == "true" && "$UPDATE_AVAILABLE" == "false" ]]; then
-        if [[ $EUID -ne 0 ]]; then
-        exec pkexec --disable-internal-agent "$0" "$@"
-        fi
-        apply_critical_update
-        exit 0
-    elif [[ "$CRITICAL_UPDATE_AVAILABLE" == "false" && "$UPDATE_AVAILABLE" == "true" ]]; then
-        if [[ $EUID -ne 0 ]]; then
-        exec pkexec --disable-internal-agent "$0" "$@"
-        fi
-        apply_regular_update $latest_version
-        exit 0
-    elif [[ "$CRITICAL_UPDATE_AVAILABLE" == "false" && "$UPDATE_AVAILABLE" == "false" ]]; then
-        exit 0
-    else
-        echo "Ошибка: неизвестная комбинация условий" >&2
-        echo $CRITICAL_UPDATE_AVAILABLE
-        echo $UPDATE_AVAILABLE
+    mkdir -p "$(dirname "$UPDATE_JSON")"
+    local url="https://otval228.github.io/methaneos_repo/versions/branch/${UPDATE_BRANCH}/${target_version}/update.json"
+    log "Загрузка информации обновления для версии $target_version"
+    if ! wget -q "$url" -O "$UPDATE_JSON"; then
+        log "Не удалось загрузить update.json для версии $target_version"
         exit 1
     fi
 }
 
-function apply_critical_update {
-    #local critical_update="$1"
-    log "Инициирую процесс критического обновления до $min_ver..."
-
-    # Получение информации для конкретной версии
-    log "Получение информации для версии $min_ver (ветка $UPDATE_BRANCH)"
-
-    local version_update_url="https://otval228.github.io/methaneos_repo/versions/branch/${UPDATE_BRANCH}/${min_ver}/update.json"
-    echo "https://otval228.github.io/methaneos_repo/versions/branch/${UPDATE_BRANCH}/${min_ver}/update.json"
-    mkdir -p /tmp/update/files
-    wget -q "$version_update_url" -O "$UPDATE_JSON" || {
-        log "Ошибка загрузки update.json для версии $min_ver"
-        exit 1
-    }
-    critical_update_version "$min_ver"
-
-    # Обновляем текущую версию после установки
-    echo "$min_ver" > "$METHANEOS_VER"
-    log "Критическое обновление успешно завершено. Текущая версия: $min_ver"
-    log "Удаляем временные файлы..."
-    cleanup
-    log "Удаление завершено, начинаем установку последней версии..."
-    CRITICAL_UPDATE_AVAILABLE=false
-   # update_redirect
-    #main
-}
-
-function apply_regular_update {
-    local latest_version="$1"
-    log "Начинаю обновление до версии $latest_version..."
-
-    mkdir -p /tmp/update/files
-    fetch_version_update_info "$latest_version"
-    update_version "$latest_version"
-
-    # Обновляем текущую версию
-    echo "$latest_version" > "$METHANEOS_VER"
-    log "Обновление успешно завершено. Текущая версия: $latest_version"
-    log "Удаляем временные файлы..."
-    UPDATE_AVAILABLE=false
-    cleanup
-}
-
-# Модифицированная функция update_version
-function critical_update_version {
-    log "Начало процесса обновления до $min_ver"
-
-    local update_json="$UPDATE_JSON"
-    local update_url="https://otval228.github.io/methaneos_repo/versions/branch/${UPDATE_BRANCH}/${min_ver}/update.squashfs"
-    echo "https://otval228.github.io/methaneos_repo/versions/branch/${UPDATE_BRANCH}/${min_ver}/update.squashfs"
-
-    log "Скачивание образа обновления..."
-    wget -q "$update_url" -O "$UPDATE_TMP/update.squashfs" || {
-        log "Ошибка загрузки образа"
-        exit 1
-    }
-
-    perform_update "$update_json"
-    echo "min_ver" > "$METHANEOS_VER"
-    log "Версия системы успешно обновлена до $min_ver"
-    log "Удаляем временные файлы..."
-    cleanup
-}
-
-# Модифицированная функция update_version
-function update_version {
+function download_update_image {
     local target_version="$1"
-    log "Начало процесса обновления до $target_version"
-
-    mkdir -p /tmp/update/files
-    local update_json="$UPDATE_JSON"
-    local update_url="https://otval228.github.io/methaneos_repo/versions/branch/${UPDATE_BRANCH}/${target_version}/update.squashfs"
-
-    log "Скачивание образа обновления..."
-    wget -q "$update_url" -O "$UPDATE_TMP/update.squashfs" || {
-        log "Ошибка загрузки образа"
+    local url="https://otval228.github.io/methaneos_repo/versions/branch/${UPDATE_BRANCH}/${target_version}/update.squashfs"
+    log "Загрузка образа обновления для версии $target_version"
+    if ! wget -q "$url" -O "$UPDATE_TMP/update.squashfs"; then
+        log "Не удалось загрузить update.squashfs для версии $target_version"
         exit 1
-    }
-
-    perform_update "$update_json"
-    echo "$target_version" > "$METHANEOS_VER"
-    log "Версия системы успешно обновлена до $target_version"
-    log "Удаляем временные файлы..."
-    cleanup
+    fi
 }
 
-# Скачивание обновления
-function fetch_update {
-    if [[ $critical_update=true ]]; then
-        echo  $critical_update
-        mkdir -p "$UPDATE_TMP/files/"
-        ls -p "$UPDATE_TMP/"
-        apply_critical_update
+function version_lt {
+    local a="$1" b="$2"
+    [[ "$a" == "$b" ]] && return 1
+    [[ "$(printf '%s\n' "$a" "$b" | sort -V | head -n1)" == "$a" ]]
+}
+
+function version_le {
+    local a="$1" b="$2"
+    [[ "$a" == "$b" ]] && return 0
+    version_lt "$a" "$b"
+}
+
+function resolve_payload_path {
+    local path="$1"
+    if [[ -z "$path" ]]; then
+        echo ""
+    elif [[ "$path" == /* ]]; then
+        echo "$path"
     else
-    log "Скачивание файла обновления $target_version"
-    #Повышение прав до root, если до сих пор нет
-    if [[ $EUID -ne 0 ]]; then
-    exec pkexec --disable-internal-agent "$0" "$@"
+        echo "$MOUNT_POINT/$path"
     fi
-    wget -q "$UPDATE_URL" -O "$UPDATE_TMP/update.squashfs"
-    mkdir -p "$UPDATE_TMP/files/"
-
-    if [ ! -f "$UPDATE_TMP/update.squashfs" ]; then
-        log "Ошибка: файл обновления не найден."
-        cleanup
-        exit 1
-    fi
- fi
 }
 
-# Основная логика обновления
-function perform_update {
-    log "Монтирование обновления..."
-    mkdir -p "$MOUNT_POINT"
-    mount -o loop "$UPDATE_TMP/update.squashfs" "$MOUNT_POINT"
-    ls $MOUNT_POINT
-
-    # Чтение действий из переданного JSON
-    local actions=$(jq -c '.actions[]' "$update_json") || {
-        log "Ошибка чтения $update_json"
-        cleanup
-        exit 1
-    }
-
-    # Проверка на опасные команды
-    function check_dangerous_commands {
-    DANGEROUS_COMMANDS=("rm -rf /" "rm -rf /*" ":(){ :|:& };:" "command >/dev/sda")
-    for cmd in "${DANGEROUS_COMMANDS[@]}"; do
-        if grep -qF "$cmd" "$1"; then
-            log "Обнаружена опасная команда: $cmd"
+function check_dangerous_commands {
+    local script_path="$1"
+    local -a dangerous=("rm -rf /" "rm -rf /*" ":(){ :|:& };:" "command >/dev/sda")
+    for cmd in "${dangerous[@]}"; do
+        if grep -qF "$cmd" "$script_path"; then
+            log "Обнаружена опасная команда в $script_path: $cmd"
             return 1
         fi
     done
     return 0
-    }
+}
 
-
-    if [[ ! -f "$UPDATE_JSON" ]]; then
-        log "Ошибка: файл update.json отсутствует."
-        ls $UPDATE_TMP/mount/
-        cleanup
-        exit 1
-    fi
-
-    log "Чтение действий обновления..."
-    actions=$(jq -c '.actions[]' "$UPDATE_JSON") || { log "Ошибка чтения update.json!"; cleanup; exit 1; }
-
-    for action in $actions; do
-        enabled=$(echo "$action" | jq -r '.enabled // true')
-        if [[ "$enabled" != "true" ]]; then
-            log "Пропуск действия: $(echo "$action" | jq -r '.type')"
-            continue
-        fi
-
-            # Действия
-    function handle_kernel {
-    log "Обновление ядра..."
-    local kernel_path="$1"
-    local initramfs_path="$2"
+function handle_kernel {
+    local kernel_path="$(resolve_payload_path "$1")"
+    local initramfs_path="$(resolve_payload_path "$2")"
     local destination="$3"
+
+    if [[ -z "$destination" ]]; then
+        log "Не указан путь назначения для ядра"
+        return 1
+    fi
 
     if [[ -f "$kernel_path" && -f "$initramfs_path" ]]; then
         cp "$kernel_path" "$destination/vmlinuz-linux"
         cp "$initramfs_path" "$destination/initramfs-linux.img"
-        mkinitcpio -p linux || { log "Ошибка при генерации initramfs."; return 1; }
-    else
-        log "Ядро или initramfs отсутствуют в обновлении."
-    fi
-    }
-
-    function handle_pacman {
-        log "Обновление пакетов через pacman..."
-        local packages=("$@")
-        if [[ "${#packages[@]}" -gt 0 ]]; then
-            for package in "${packages[@]}"; do
-                if [[ ! -f "$package" ]]; then
-                    log "Пакет $package не найден. Пропуск."
-                    continue
-                fi
-                sudo pacman -U "$package" --noconfirm || { log "Ошибка обновления пакета $package."; return 1; }
-            done
-        else
-        log "Нет пакетов для обновления."
+        if command -v mkinitcpio >/dev/null 2>&1; then
+            mkinitcpio -p linux
         fi
-        }
+    else
+        log "Ядро или initramfs отсутствуют в образе обновления"
+        return 1
+    fi
+}
 
-        function handle_script {
-            log "Выполнение пользовательского скрипта..."
-            local script_path="$1"
+function handle_pacman {
+    local packages=("$@")
+    if [[ ${#packages[@]} -eq 0 ]]; then
+        log "Нет пакетов для обновления через pacman"
+        return 0
+    fi
 
-            if [[ ! -f "$script_path" ]]; then
-            log "Ошибка: скрипт $script_path не найден."
-            return 1
-            fi
+    local resolved=()
+    for pkg in "${packages[@]}"; do
+        local path="$(resolve_payload_path "$pkg")"
+        if [[ -n "$path" ]]; then
+            resolved+=("$path")
+        fi
+    done
 
-            if [[ ! -x "$script_path" ]]; then
-            log "Скрипт $script_path не имеет прав на выполнение. Добавляем права..."
-            chmod +x "$script_path" || { log "Ошибка изменения прав на $script_path"; return 1; }
-            fi
+    if [[ ${#resolved[@]} -eq 0 ]]; then
+        log "Не удалось определить пути пакетов для обновления"
+        return 1
+    fi
 
-            check_dangerous_commands "$script_path" || { log "Обнаружены опасные команды в $script_path."; return 1; }
-            bash "$script_path" || { log "Ошибка выполнения скрипта $script_path."; return 1; }
-            }
+    pacman -U "${resolved[@]}" --noconfirm
+}
 
-        type=$(echo "$action" | jq -r '.type')
+function handle_script {
+    local script_path="$(resolve_payload_path "$1")"
+    if [[ ! -f "$script_path" ]]; then
+        log "Скрипт $script_path не найден"
+        return 1
+    fi
+
+    if [[ ! -x "$script_path" ]]; then
+        chmod +x "$script_path"
+    fi
+
+    check_dangerous_commands "$script_path"
+    bash "$script_path"
+}
+
+function perform_update {
+    local update_json_path="$1"
+    if [[ ! -f "$update_json_path" ]]; then
+        log "Файл $update_json_path отсутствует"
+        exit 1
+    fi
+
+    mkdir -p "$MOUNT_POINT"
+    log "Монтирование обновления..."
+    mount -o loop "$UPDATE_TMP/update.squashfs" "$MOUNT_POINT"
+
+    local update_status="успешно"
+    mapfile -t actions < <(jq -c '.actions[]?' "$update_json_path")
+
+    for action in "${actions[@]}"; do
+        local enabled
+        enabled=$(jq -r '.enabled // true' <<<"$action")
+        if [[ "$enabled" != "true" ]]; then
+            log "Пропуск действия: $(jq -r '.type' <<<"$action")"
+            continue
+        fi
+
+        local type
+        type=$(jq -r '.type' <<<"$action")
         case "$type" in
             kernel)
-                handle_kernel "$(echo "$action" | jq -r '.path')" \
-                              "$(echo "$action" | jq -r '.initramfs')" \
-                              "$(echo "$action" | jq -r '.destination')" || update_status="неуспешно"
+                handle_kernel \
+                    "$(jq -r '.path' <<<"$action")" \
+                    "$(jq -r '.initramfs' <<<"$action")" \
+                    "$(jq -r '.destination' <<<"$action")" || update_status="неуспешно"
                 ;;
             pacman)
-                packages=($(echo "$action" | jq -r '.packages[]'))
-                handle_pacman "${packages[@]}" || update_status="неуспешно"
+                mapfile -t pkgs < <(jq -r '.packages[]?' <<<"$action")
+                handle_pacman "${pkgs[@]}" || update_status="неуспешно"
                 ;;
             script)
-                handle_script "$(echo "$action" | jq -r '.script_path')" || update_status="неуспешно"
+                handle_script "$(jq -r '.script_path' <<<"$action")" || update_status="неуспешно"
+                ;;
+            files)
+                mapfile -t files < <(jq -c '.files[]?' <<<"$action")
+                for file_desc in "${files[@]}"; do
+                    local src dst
+                    src=$(resolve_payload_path "$(jq -r '.source // empty' <<<"$file_desc")")
+                    dst=$(jq -r '.destination // empty' <<<"$file_desc")
+                    if [[ -z "$dst" ]]; then
+                        log "Не указан путь назначения для файла"
+                        update_status="неуспешно"
+                        continue
+                    fi
+                    if [[ -z "$src" || ! -f "$src" ]]; then
+                        log "Источник файла $src не найден"
+                        update_status="неуспешно"
+                        continue
+                    fi
+                    mkdir -p "$(dirname "$dst")"
+                    cp "$src" "$dst"
+                done
                 ;;
             *)
                 log "Неизвестный тип действия: $type"
@@ -482,75 +292,231 @@ function perform_update {
         esac
     done
 
+    umount "$MOUNT_POINT" || log "Не удалось размонтировать $MOUNT_POINT"
+    rm -f "$UPDATE_TMP/update.squashfs"
+
+    if [[ "$update_status" != "успешно" ]]; then
+        log "Обновление завершилось с ошибками"
+        exit 1
+    fi
+}
+
+function create_backup {
+    if [[ "$BACKUP_ENABLED" != "true" ]]; then
+        log "Резервное копирование отключено"
+        return
+    fi
+
+    local backup_dir="$BACKUP_DIR/backup-$(date '+%Y%m%d%H%M%S')"
+    mkdir -p "$backup_dir"
+    log "Создание резервной копии в $backup_dir"
+
+    mapfile -t actions < <(jq -c '.actions[]' "$UPDATE_JSON" 2>/dev/null || printf '')
+    for action in "${actions[@]}"; do
+        local type enabled
+        enabled=$(jq -r '.enabled // true' <<<"$action")
+        if [[ "$enabled" != "true" ]]; then
+            continue
+        fi
+        type=$(jq -r '.type' <<<"$action")
+        if [[ "$type" == "files" ]]; then
+            mapfile -t files < <(jq -r '.files_path[]?' <<<"$action")
+            for file in "${files[@]}"; do
+                if [[ -f "$file" ]]; then
+                    local dest
+                    dest="$backup_dir$(dirname "$file")"
+                    mkdir -p "$dest"
+                    cp "$file" "$dest/"
+                fi
+            done
+        fi
+    done
+
+    cleanup_old_backups
+}
+
+function build_version_sequence {
+    local current="$1"
+    local minimum="$2"
+    local target="$3"
+    shift 3
+    local -a available=("$@")
+    local -a candidates=()
+
+    if version_lt "$current" "$minimum"; then
+        candidates+=("$minimum")
+    fi
+
+    if [[ ${#available[@]} -gt 0 ]]; then
+        candidates+=("${available[@]}")
+    fi
+
+    candidates+=("$target")
+
+    mapfile -t candidates < <(printf '%s\n' "${candidates[@]}" | awk 'NF' | sort -V | uniq)
+
+    local -a sequence=()
+    for version in "${candidates[@]}"; do
+        if version_lt "$current" "$version" && version_le "$version" "$target"; then
+            sequence+=("$version")
+        fi
+    done
+
+    printf '%s\n' "${sequence[@]}"
+}
+
+function apply_update_sequence {
+    local -a versions=("$@")
+    if [[ ${#versions[@]} -eq 0 ]]; then
+        log "Нет доступных версий для обновления"
+        return
+    fi
+
+    ensure_root_for_update
+    trap cleanup EXIT
+
+    mkdir -p "$UPDATE_TMP/files"
+
+    local first=true
+    for version in "${versions[@]}"; do
+        log "Начало установки обновления $version"
+        fetch_version_update_info "$version"
+        if $first; then
+            create_backup
+            first=false
+        fi
+        download_update_image "$version"
+        perform_update "$UPDATE_JSON"
+        echo "$version" >"$METHANEOS_VER"
+        CURRENT_VERSION="$version"
+        log "Версия системы обновлена до $version"
+    done
+
+    trap - EXIT
     cleanup
-    log "Обновление завершено успешно."
+    log "Цепочка обновлений завершена"
 }
 
-# Основная функция
-function main {
-   # cleanup_old_backups
-    #fetch_update_info
-    #fetch_latest_update_info
-    check_update
-    update_redirect "$critical_update" "$UPDATE_AVAILABLE"
-    #verify_update
+function check_update {
+    load_config
+    fetch_latest_update_info
 
-    local action="$1"
+    CURRENT_VERSION="0"
+    if [[ -f "$METHANEOS_VER" ]]; then
+        CURRENT_VERSION="$(tr -d '\n\r[:space:]' <"$METHANEOS_VER")"
+    fi
 
-    # Если действие "check_update" — проверить обновления и завершиться
-    if [[ "$action" == "force-update" ]]; then
-        force_update  # Ваша функция принудительного обновления
+    local latest_info="$LATEST_INFO_PATH"
+    LATEST_VERSION="$(jq -r '.version // ""' "$latest_info")"
+    MIN_VERSION="$(jq -r '.minver // ""' "$latest_info")"
+    local json_update_available
+    json_update_available="$(jq -r '.update_available // true' "$latest_info")"
+    mapfile -t AVAILABLE_VERSIONS < <(jq -r '.available_versions[]?' "$latest_info")
+
+    local changelog
+    changelog="$(jq -r '.changelog // empty' "$latest_info")"
+    if [[ -n "$changelog" ]]; then
+        echo -e "\e[32mChangelog:\e[0m $changelog"
+    fi
+
+    log "Текущая версия: $CURRENT_VERSION | Минимальная: $MIN_VERSION | Последняя: $LATEST_VERSION | Доступно: $json_update_available"
+
+    CRITICAL_UPDATE_AVAILABLE=false
+    UPDATE_AVAILABLE=false
+
+    if [[ -n "$MIN_VERSION" ]] && version_lt "$CURRENT_VERSION" "$MIN_VERSION"; then
+        CRITICAL_UPDATE_AVAILABLE=true
+        log "Требуется обновление до минимальной версии $MIN_VERSION"
+    fi
+
+    if [[ "$json_update_available" == "true" ]] && [[ -n "$LATEST_VERSION" ]] && version_lt "$CURRENT_VERSION" "$LATEST_VERSION"; then
+        UPDATE_AVAILABLE=true
+        log "Доступно обновление до версии $LATEST_VERSION"
+    elif [[ "$json_update_available" != "true" ]] && version_lt "$CURRENT_VERSION" "$LATEST_VERSION"; then
+        log "Версия $LATEST_VERSION пока недоступна для скачивания"
     else
-    # Если вызвано с check, выходим
-    if [[ "$1" == "check" ]]; then
-        cleanup
-        exit 0
-    fi
+        log "Система актуальна"
     fi
 }
 
+function run_default_update {
+    check_update
 
-# Обработка аргументов командной строки
-case "$1" in
+    if [[ "$CRITICAL_UPDATE_AVAILABLE" != "true" && "$UPDATE_AVAILABLE" != "true" ]]; then
+        return
+    fi
+
+    local target="$CURRENT_VERSION"
+    if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+        target="$LATEST_VERSION"
+    elif [[ "$CRITICAL_UPDATE_AVAILABLE" == "true" ]]; then
+        target="$MIN_VERSION"
+    fi
+
+    mapfile -t versions < <(build_version_sequence "$CURRENT_VERSION" "$MIN_VERSION" "$target" "${AVAILABLE_VERSIONS[@]}")
+    apply_update_sequence "${versions[@]}"
+}
+
+function apply_only_critical {
+    check_update
+    if [[ "$CRITICAL_UPDATE_AVAILABLE" != "true" ]]; then
+        log "Критические обновления отсутствуют"
+        return
+    fi
+    mapfile -t versions < <(build_version_sequence "$CURRENT_VERSION" "$MIN_VERSION" "$MIN_VERSION" "${AVAILABLE_VERSIONS[@]}")
+    apply_update_sequence "${versions[@]}"
+}
+
+function change_branch {
+    local new_branch="$1"
+    if [[ -z "$new_branch" ]]; then
+        echo "Ошибка: не указана ветка. Допустимые значения: stable, beta, dev" >&2
+        exit 1
+    fi
+
+    local -a allowed=("stable" "beta" "dev")
+    local found=false
+    for branch in "${allowed[@]}"; do
+        if [[ "$branch" == "$new_branch" ]]; then
+            found=true
+            break
+        fi
+    done
+
+    if [[ "$found" != true ]]; then
+        echo "Ошибка: некорректная ветка '$new_branch'. Допустимые значения: ${allowed[*]}" >&2
+        exit 1
+    fi
+
+    ensure_root_for_update
+
+    load_config
+    sed -i 's/^BRANCH=.*/BRANCH='"$new_branch"'/' "$CONFIG_FILE"
+    sed -i 's/^UPDATE_BRANCH=.*/UPDATE_BRANCH='"$new_branch"'/' "$CONFIG_FILE"
+    echo "Ветка успешно изменена на '$new_branch'"
+}
+
+case "${1:-}" in
     --check|check)
-        # Передаем действие "check_update" и завершаем скрипт
         check_update
         ;;
     --force-update|force-update)
-        main
-        ;;
-    --branch)
-        # Проверяем, что указано значение ветки
-        if [[ -z "$2" ]]; then
-            echo "Ошибка: не указана ветка. Допустимые значения: stable, beta, dev" >&2
-            exit 1
-        fi
-
-        # Проверяем корректность значения
-        allowed_branches=("stable" "beta" "dev")
-        if [[ ! " ${allowed_branches[@]} " =~ " $2 " ]]; then
-            echo "Ошибка: некорректная ветка '$2'. Допустимые значения: ${allowed_branches[*]}" >&2
-            exit 1
-        fi
-
-        if [[ $EUID -ne 0 ]]; then
-        log "Повышение привилегий для выполнения: $0 $*"
-        exec pkexec --disable-internal-agent "$0" "$@"
-        exit
-        fi
-        # Заменяем значение BRANCH в конфиге (только последнюю строку)
-        sed -i '$ s/BRANCH=.*/BRANCH='"$2"'/' "$CONFIG_FILE"
-        echo "Ветка успешно изменена на '$2'"
-        exit 0
+        run_default_update
         ;;
     --apply-critical)
-        result=$(check_update)
-        IFS='|' read -r critical_update update_available latest_version min_ver <<< "$result"
-        [[ "$critical_update" == "true" ]] && apply_critical_update "$min_ver"
+        apply_only_critical
+        ;;
+    --branch)
+        change_branch "${2:-}"
+        ;;
+    ""|--update)
+        run_default_update
         ;;
     *)
-        main "default_action"
+        echo "Неизвестный аргумент: $1" >&2
+        echo "Доступные команды: --check, --force-update, --apply-critical, --branch <name>" >&2
+        exit 1
         ;;
-esac
+ esac
 
 exit 0
